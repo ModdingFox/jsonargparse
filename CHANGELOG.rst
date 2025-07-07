@@ -15,6 +15,14 @@ paths are considered internals and can change in minor and patch releases.
 v5.0.0 (unreleased)
 -------------------
 
+Added
+^^^^^
+- Support for Pydantic models with ``extra`` field configuration (``allow``,
+  ``forbid``, ``ignore``). Models with ``extra="allow"`` now accept additional
+  fields, while ``extra="forbid"`` properly rejects them and ``extra="ignore"``
+  accepts but ignores extra fields during instantiation (`#732
+  <https://github.com/omni-us/jsonargparse/pull/732>`__).
+
 Changed
 ^^^^^^^
 - The print config argument now defaults to ``--print_<config_arg_name>``,

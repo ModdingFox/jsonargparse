@@ -1222,7 +1222,17 @@ class ArgumentParser(ActionsContainer, argparse.ArgumentParser):
                     group_key = next((g for g in self.groups if key.startswith(g + ".")), None)
                     if group_key:
                         subkey = key[len(group_key) + 1 :]
-                        raise NSKeyError(f"Group '{group_key}' does not accept option '{subkey}'")
+                        group = self.groups[group_key]
+                        should_raise_error = True
+                        if getattr(group, "group_class", None):
+                            from ._optionals import get_pydantic_extra_config
+
+                            extra_config = get_pydantic_extra_config(group.group_class)
+                            if extra_config in {"allow", "ignore"}:
+                                should_raise_error = False
+                        if should_raise_error:
+                            raise NSKeyError(f"Group '{group_key}' does not accept option '{subkey}'")
+                        continue
                     if self._subcommands_action:
                         if cfg.get(self._subcommands_action.dest):
                             subcommand = f"'{cfg[self._subcommands_action.dest]}'"
