@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import calendar
 import importlib.util
 import json
 import pickle
@@ -7,12 +8,12 @@ import random
 import sys
 import time
 import uuid
-from collections import OrderedDict, deque
+from collections import OrderedDict, abc, deque
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from textwrap import dedent
-from types import MappingProxyType
+from types import GenericAlias, MappingProxyType, ModuleType, UnionType
 from typing import (
     Any,
     Callable,
@@ -47,6 +48,7 @@ from jsonargparse._typehints import (
     get_all_subclass_paths,
     get_subclass_types,
     is_optional,
+    is_typed_dict_subtype,
     type_to_str,
 )
 from jsonargparse._util import get_import_path
@@ -753,6 +755,300 @@ def test_typeddict_with_required_arg(parser):
     with pytest.raises(ArgumentError) as ctx:
         parser.parse_args(['--typeddict={"a":1, "b":"x"}'])
     ctx.match("Expected a <class 'int'>")
+
+
+# type[TypedDict] tests. TypedDicts don't support issubclass, so the check is structural.
+
+
+class StateDict(TypedDict):
+    messages: list
+
+
+class SubStateDict(StateDict):
+    extra: int
+
+
+class SameKeysDict(TypedDict):
+    messages: list
+
+
+class DifferentTypeDict(TypedDict):
+    messages: dict
+
+
+class MissingKeyDict(TypedDict):
+    extra: int
+
+
+class NotTotalStateDict(TypedDict, total=False):
+    messages: list
+
+
+def test_type_typeddict_accepts_self_and_subclass(parser):
+    parser.add_argument("--cls", type=Type[StateDict])
+    assert parser.parse_args([f"--cls={__name__}.StateDict"]).cls is StateDict
+    assert parser.parse_args([f"--cls={__name__}.SubStateDict"]).cls is SubStateDict
+    assert json_or_yaml_load(parser.dump(parser.parse_args([f"--cls={__name__}.SubStateDict"]))) == {
+        "cls": f"{__name__}.SubStateDict"
+    }
+
+
+def test_type_typeddict_accepts_structurally_equivalent(parser):
+    parser.add_argument("--cls", type=Type[StateDict])
+    assert parser.parse_args([f"--cls={__name__}.SameKeysDict"]).cls is SameKeysDict
+
+
+def test_type_typeddict_rejects_incompatible(parser):
+    parser.add_argument("--cls", type=Type[StateDict])
+    for name in ["DifferentTypeDict", "MissingKeyDict", "NotTotalStateDict"]:
+        with pytest.raises(ArgumentError) as ctx:
+            parser.parse_args([f"--cls={__name__}.{name}"])
+        ctx.match("Expected an import path corresponding to a")
+    with pytest.raises(ArgumentError) as ctx:
+        parser.parse_args(["--cls=uuid.UUID"])
+    ctx.match("Expected an import path corresponding to a")
+
+
+def test_type_typeddict_optional(parser):
+    parser.add_argument("--cls", type=Optional[Type[StateDict]], default=None)
+    assert parser.parse_args([]).cls is None
+    assert parser.parse_args(["--cls=null"]).cls is None
+    assert parser.parse_args([f"--cls={__name__}.SubStateDict"]).cls is SubStateDict
+
+
+@pytest.mark.skipif(not NotRequired, reason="NotRequired introduced in python 3.11 or backported in typing_extensions")
+def test_is_typed_dict_subtype_not_required_key():
+    base = TypedDict("BaseNotRequiredDict", {"a": NotRequired[int]})
+    not_total = TypedDict("NotTotalDict", {"a": int}, total=False)
+    total = TypedDict("TotalDict", {"a": int})
+    assert is_typed_dict_subtype(not_total, base)
+    assert not is_typed_dict_subtype(total, base)
+
+
+def test_type_typeddict_help(parser):
+    parser.add_argument("--cls", type=Optional[Type[StateDict]], default=None)
+    help_str = get_parser_help(parser)
+    assert "--cls CLS" in help_str
+    assert "StateDict" in help_str
+    assert "default: null" in help_str
+
+
+# ModuleType tests. The value is the import path of a module, which is only
+# imported when instantiate_classes is run.
+
+
+@pytest.fixture
+def unimported_module(tmp_path, monkeypatch):
+    name = "jsonargparse_tests_unimported_module"
+    (tmp_path / f"{name}.py").write_text("value = 3\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    assert name not in sys.modules
+    yield name
+    sys.modules.pop(name, None)
+
+
+def test_module_type_parse_keeps_import_path(parser):
+    parser.add_argument("--mod", type=ModuleType)
+    cfg = parser.parse_args(["--mod=json"])
+    assert cfg.mod == "json"
+
+
+def test_module_type_parse_submodule(parser):
+    parser.add_argument("--mod", type=ModuleType)
+    cfg = parser.parse_args(["--mod=json.decoder"])
+    assert cfg.mod == "json.decoder"
+    init = parser.instantiate(cfg)
+    assert init.mod is json.decoder
+
+
+def test_module_type_not_imported_on_parse(parser, unimported_module):
+    parser.add_argument("--mod", type=ModuleType)
+    cfg = parser.parse_args([f"--mod={unimported_module}"])
+    assert cfg.mod == unimported_module
+    assert unimported_module not in sys.modules
+
+
+def test_module_type_instantiate_imports_module(parser, unimported_module):
+    parser.add_argument("--mod", type=ModuleType)
+    cfg = parser.parse_args([f"--mod={unimported_module}"])
+    init = parser.instantiate(cfg)
+    assert isinstance(init.mod, ModuleType)
+    assert init.mod.value == 3
+    assert unimported_module in sys.modules
+
+
+@pytest.mark.parametrize("value", ["not_a_module", "uuid.UUID", "json.not_a_submodule", "not.a.module", "", "1json"])
+def test_module_type_invalid_import_path(parser, value):
+    parser.add_argument("--mod", type=ModuleType)
+    with pytest.raises(ArgumentError) as ctx:
+        parser.parse_args([f"--mod={value}"])
+    ctx.match("Expected an import path corresponding to a module")
+
+
+def test_module_type_optional(parser):
+    parser.add_argument("--mod", type=Optional[ModuleType], default=None)
+    assert parser.parse_args([]).mod is None
+    assert parser.parse_args(["--mod=null"]).mod is None
+    cfg = parser.parse_args(["--mod=json"])
+    assert cfg.mod == "json"
+    assert parser.instantiate(cfg).mod is json
+
+
+def test_module_type_default_module_object(parser):
+    parser.add_argument("--mod", type=ModuleType, default=json)
+    cfg = parser.parse_args([])
+    assert cfg.mod == "json"
+    assert parser.instantiate(cfg).mod is json
+
+
+def test_module_type_list(parser):
+    parser.add_argument("--mods", type=List[ModuleType], default=[])
+    cfg = parser.parse_args(['--mods=["json", "uuid"]'])
+    assert cfg.mods == ["json", "uuid"]
+    assert parser.instantiate(cfg).mods == [json, uuid]
+
+
+def test_module_type_dump(parser):
+    parser.add_argument("--mod", type=ModuleType)
+    cfg = parser.parse_args(["--mod=json"])
+    assert json_or_yaml_load(parser.dump(cfg)) == {"mod": "json"}
+
+
+def test_module_type_dump_module_object(parser):
+    parser.add_argument("--mod", type=ModuleType)
+    cfg = parser.parse_args(["--mod=json"])
+    cfg.mod = json
+    assert json_or_yaml_load(parser.dump(cfg)) == {"mod": "json"}
+
+
+def test_module_type_help(parser):
+    parser.add_argument("--mod", type=ModuleType, help="Module to use.")
+    help_str = get_parser_help(parser)
+    assert "--mod MOD" in help_str
+    assert "Module to use. (type: ModuleType, default: null)" in help_str
+
+
+class WithModule:
+    def __init__(self, mod: ModuleType, num: int = 1):
+        self.mod = mod
+        self.num = num
+
+
+def test_module_type_class_group_instantiate(parser):
+    parser.add_class_arguments(WithModule, "cls")
+    cfg = parser.parse_args(["--cls.mod=json"])
+    assert cfg.cls.mod == "json"
+    init = parser.instantiate(cfg)
+    assert init.cls.mod is json
+
+
+def test_module_type_subclass_init_arg_instantiate(parser):
+    parser.add_argument("--cls", type=WithModule)
+    cfg = parser.parse_args([f"--cls={__name__}.WithModule", "--cls.mod=json"])
+    assert cfg.cls.init_args.mod == "json"
+    init = parser.instantiate(cfg)
+    assert init.cls.mod is json
+
+
+# types.UnionType and types.GenericAlias tests. The value is a string with a type
+# expression, e.g. "int | str" and "list[int]".
+
+
+def test_union_type_parse(parser):
+    parser.add_argument("--type", type=UnionType)
+    assert parser.parse_args(["--type=int | str"]).type == int | str
+    assert parser.parse_args(["--type=int|None"]).type == Optional[int]
+    assert parser.parse_args(["--type=calendar.Calendar | uuid.UUID"]).type == calendar.Calendar | uuid.UUID
+
+
+def test_union_type_parse_subscripted_subtype(parser):
+    parser.add_argument("--type", type=UnionType)
+    assert parser.parse_args(["--type=list[int] | str"]).type == list[int] | str
+
+
+@pytest.mark.parametrize("value", ["int", "list[int]", "not_a_type | int", "int |", "1 + 2", "print('x')", ""])
+def test_union_type_invalid(parser, value):
+    parser.add_argument("--type", type=UnionType)
+    with pytest.raises(ArgumentError) as ctx:
+        parser.parse_args([f"--type={value}"])
+    ctx.match("Expected a string with a UnionType type expression")
+
+
+def test_union_type_dump(parser):
+    parser.add_argument("--type", type=UnionType)
+    cfg = parser.parse_args(["--type=int | str"])
+    assert json_or_yaml_load(parser.dump(cfg)) == {"type": "int | str"}
+
+
+def test_union_type_default(parser):
+    parser.add_argument("--type", type=UnionType, default=int | str)
+    cfg = parser.parse_args([])
+    assert cfg.type == int | str
+    assert json_or_yaml_load(parser.dump(cfg)) == {"type": "int | str"}
+
+
+def test_union_type_optional(parser):
+    parser.add_argument("--type", type=Optional[UnionType], default=None)
+    assert parser.parse_args([]).type is None
+    assert parser.parse_args(["--type=null"]).type is None
+    assert parser.parse_args(["--type=int | str"]).type == int | str
+
+
+def test_union_type_help(parser):
+    parser.add_argument("--type", type=UnionType, help="Type to use.")
+    help_str = get_parser_help(parser)
+    assert "--type TYPE" in help_str
+    assert "Type to use. (type: UnionType, default: null)" in help_str
+
+
+def test_generic_alias_parse(parser):
+    parser.add_argument("--type", type=GenericAlias)
+    assert parser.parse_args(["--type=list[int]"]).type == list[int]
+    assert parser.parse_args(["--type=dict[str, Any]"]).type == dict[str, Any]
+    assert parser.parse_args(["--type=tuple[int, ...]"]).type == tuple[int, ...]
+    assert parser.parse_args(["--type=list[calendar.Calendar]"]).type == list[calendar.Calendar]
+    assert parser.parse_args(["--type=collections.abc.Callable[[int], str]"]).type == abc.Callable[[int], str]
+
+
+@pytest.mark.parametrize("value", ["int", "int | str", "List[int]", "list[not_a_type]", "list[", ""])
+def test_generic_alias_invalid(parser, value):
+    parser.add_argument("--type", type=GenericAlias)
+    with pytest.raises(ArgumentError) as ctx:
+        parser.parse_args([f"--type={value}"])
+    ctx.match("Expected a string with a GenericAlias type expression")
+
+
+def test_generic_alias_dump(parser):
+    parser.add_argument("--type", type=GenericAlias)
+    cfg = parser.parse_args(["--type=dict[str, int]"])
+    assert json_or_yaml_load(parser.dump(cfg)) == {"type": "dict[str, int]"}
+
+
+def test_generic_alias_help(parser):
+    parser.add_argument("--type", type=GenericAlias, help="Type to use.")
+    help_str = get_parser_help(parser)
+    assert "Type to use. (type: GenericAlias, default: null)" in help_str
+
+
+def function_schema(schema: Union[type, UnionType, Dict[str, Any]] = int):
+    return schema  # pragma: no cover
+
+
+def test_type_or_union_type_or_dict_function(parser):
+    added = parser.add_function_arguments(function_schema, "fn")
+    assert added == ["fn.schema"]
+    assert parser.parse_args([]).fn.schema is int
+    assert parser.parse_args(["--fn.schema=calendar.Calendar"]).fn.schema is calendar.Calendar
+    assert parser.parse_args(["--fn.schema=int | str"]).fn.schema == int | str
+    assert parser.parse_args(['--fn.schema={"key": 1}']).fn.schema == {"key": 1}
+
+
+def test_union_type_list(parser):
+    parser.add_argument("--types", type=List[UnionType], default=[])
+    cfg = parser.parse_args(['--types=["int | str", "float | None"]'])
+    assert cfg.types == [int | str, Optional[float]]
+    assert json_or_yaml_load(parser.dump(cfg)) == {"types": ["int | str", "float | None"]}
 
 
 # Required/NotRequired as the type of an argument. The wrapper must agree with the

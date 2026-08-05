@@ -532,7 +532,13 @@ Some notes about this support are:
   fine-grained specification of required/optional ``TypedDict`` keys.
   ``Unpack`` is supported with ``TypedDict`` for more precise ``**kwargs``
   typing as described in PEP `692 <https://peps.python.org/pep-0692/>`__.
-  For more details see :ref:`dict-items`.
+  For more details see :ref:`dict-items`. A ``TypedDict`` can also be used as
+  the argument of ``type``, e.g. ``type[SomeTypedDict]``, in which case the
+  value is an import path to a class. Since ``TypedDict`` classes don't support
+  ``issubclass``, the given class is accepted when it is structurally
+  compatible, as specified in PEP `589 <https://peps.python.org/pep-0589/>`__,
+  i.e. it has all the keys of the expected ``TypedDict``, with the same types
+  and requiredness.
 
 - ``tuple``, ``set``, ``frozenset`` and ``MutableSet`` are supported even though
   they can't be represented in JSON distinguishable from a list. Each ``tuple``
@@ -590,6 +596,15 @@ Some notes about this support are:
   or provide a function that returns the instance of the class. For more details
   see :ref:`callable-type`. Currently the callable's argument and return types
   are not validated.
+
+- ``types.ModuleType`` is supported by giving the dot import path of a module,
+  and on ``instantiate`` is replaced by the imported module object.
+
+- ``types.UnionType`` and ``types.GenericAlias``, commonly found in third party
+  libraries in unions such as ``type | UnionType | dict``, are supported by
+  giving a string with a type expression, e.g. ``"int | str"`` and
+  ``"list[int]"``. The expression is resolved without evaluating code, so its
+  names must be builtins, ``typing`` names or dot import paths.
 
 - ``TypeAliasType`` is supported with values parsed as the aliased type and the
   alias shown as the argument type in help.

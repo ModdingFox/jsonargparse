@@ -1,9 +1,12 @@
 """Action to support type hints."""
 
+import ast
+import builtins
 import inspect
 import os
 import re
 import sys
+import typing
 from argparse import ArgumentError
 from collections import OrderedDict, abc, defaultdict, deque
 from contextlib import contextmanager, suppress
@@ -12,7 +15,8 @@ from copy import deepcopy
 from enum import Enum
 from functools import partial
 from importlib import import_module
-from types import FunctionType, MappingProxyType
+from importlib.util import find_spec
+from types import FunctionType, GenericAlias, MappingProxyType, ModuleType, UnionType
 from typing import (
     Any,
     Callable,
@@ -151,6 +155,9 @@ root_types = {
     OrderedDict,
     Callable,
     abc.Callable,
+    ModuleType,
+    UnionType,
+    GenericAlias,
     NotRequired,
     Required,
     Unpack,
@@ -357,6 +364,8 @@ class ActionTypeHint(Action):
             default.class_path = normalize_import_path(default.class_path, self._typehint)
         elif is_enum_type(self._typehint) and isinstance(default, Enum):
             default = default.name
+        elif is_module_type(self._typehint) and isinstance(default, ModuleType):
+            default = default.__name__
         elif is_callable_type(self._typehint) and callable(default) and not inspect.isclass(default):
             default = get_import_path(default)
         elif ActionTypeHint.is_return_subclass_typehint(self._typehint) and inspect.isclass(default):
@@ -460,6 +469,11 @@ class ActionTypeHint(Action):
         ):
             return True
         return False
+
+    @staticmethod
+    def is_module_typehint(typehint):
+        typehint = typehint_from_action(typehint)
+        return typehint is not None and is_module_type(typehint)
 
     @staticmethod
     def is_callable_typehint(typehint):
@@ -917,7 +931,9 @@ def replace_unresolved_forward_refs(typehint):
     if get_typehint_origin(typehint) in literal_types:
         return typehint  # the args of a Literal are values, not types
     args = getattr(typehint, "__args__", None)
-    if not args:
+    # only a tuple, since e.g. types.UnionType and types.GenericAlias have __args__ as a
+    # class level slot descriptor, which is truthy but not the subtypes of an instance
+    if not isinstance(args, tuple) or not args:
         return typehint
     new_args = tuple(replace_unresolved_forward_refs(a) for a in args)
     if new_args == args:
@@ -991,6 +1007,85 @@ def get_typed_dict_required_keys(typed_dict, annotations: dict) -> set:
     return required_keys
 
 
+def get_typed_dict_key_type(annotation):
+    # Required and NotRequired only change the requiredness of a key, not its type
+    if get_typehint_origin(annotation) in not_required_required_types:
+        return annotation.__args__[0]
+    return annotation
+
+
+def is_typed_dict_subtype(subtype, typed_dict, logger=None) -> bool:
+    # TypedDicts don't support issubclass, so as specified in PEP 589 the check is done
+    # structurally, i.e. the subtype must have all keys of the typed dict, with the same
+    # types and requiredness.
+    if type(subtype) not in typed_dict_meta_types:
+        return False
+    if subtype is typed_dict:
+        return True
+    annotations = get_typed_dict_annotations(typed_dict, logger)
+    sub_annotations = get_typed_dict_annotations(subtype, logger)
+    for key, annotation in annotations.items():
+        if key not in sub_annotations:
+            return False
+        if get_typed_dict_key_type(sub_annotations[key]) != get_typed_dict_key_type(annotation):
+            return False
+    required_keys = get_typed_dict_required_keys(typed_dict, annotations)
+    sub_required_keys = get_typed_dict_required_keys(subtype, sub_annotations)
+    return required_keys == sub_required_keys & annotations.keys()
+
+
+def is_importable_module_path(val) -> bool:
+    """Whether a value is the import path of a module, checked without importing it.
+
+    Only the parent packages of the module get imported, which is unavoidable
+    since they are the ones that know how to find their submodules.
+    """
+    if not isinstance(val, str) or not all(p.isidentifier() for p in val.split(".")):
+        return False
+    if val in sys.modules:
+        return True
+    try:
+        return find_spec(val) is not None
+    except (ImportError, AttributeError, TypeError, ValueError):
+        return False
+
+
+type_expression_types = {UnionType: "UnionType", GenericAlias: "GenericAlias"}
+
+
+def resolve_type_expression_node(node):
+    """Returns the type that an ast node of a type expression represents."""
+    if isinstance(node, ast.Constant):
+        return NoneType if node.value is None else node.value
+    if isinstance(node, ast.Name):
+        for namespace in (builtins, typing):
+            if hasattr(namespace, node.id):
+                return getattr(namespace, node.id)
+        raise ValueError(f"Not a builtin or typing name: {node.id}")
+    if isinstance(node, ast.Attribute):
+        return import_object(ast.unparse(node))
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        return resolve_type_expression_node(node.left) | resolve_type_expression_node(node.right)
+    if isinstance(node, ast.Subscript):
+        return resolve_type_expression_node(node.value)[resolve_type_expression_node(node.slice)]
+    if isinstance(node, ast.Tuple):
+        return tuple(resolve_type_expression_node(e) for e in node.elts)
+    if isinstance(node, ast.List):
+        return [resolve_type_expression_node(e) for e in node.elts]
+    raise ValueError(f"Unsupported type expression: {ast.unparse(node)}")
+
+
+def str_to_type_expression(val: str):
+    """Returns the type that a string type expression represents, e.g. ``"int | str"``.
+
+    The expression is resolved from its ast instead of being evaluated, such that only
+    names, dot import paths, unions and subscripts are accepted, i.e. no arbitrary code.
+    """
+    if not isinstance(val, str):
+        raise ValueError(f"Expected a string, got {type(val)}")
+    return resolve_type_expression_node(ast.parse(val, mode="eval").body)
+
+
 def adapt_typehints(
     val,
     typehint,
@@ -1004,7 +1099,8 @@ def adapt_typehints(
     default=None,
     logger=None,
 ):
-    if type(val) in {str, bool, int, float} and val == default:
+    # A module import path equal to the default still needs to be imported on instantiation
+    if type(val) in {str, bool, int, float} and val == default and not (instantiate_classes and typehint is ModuleType):
         return val
 
     adapt_kwargs = {
@@ -1088,10 +1184,40 @@ def adapt_typehints(
         elif not serialize and not isinstance(val, type):
             path = val
             val = import_object(val)
-            if (typehint in {Type, type} and not isinstance(val, type)) or (
-                typehint not in {Type, type} and not is_subclass(val, subtypehints[0])
-            ):
+            if typehint in {Type, type}:
+                valid = isinstance(val, type)
+            elif type(subtypehints[0]) in typed_dict_meta_types:
+                valid = is_typed_dict_subtype(val, subtypehints[0], logger)
+            else:
+                valid = is_subclass(val, subtypehints[0])
+            if not valid:
                 raise_unexpected_value(f"Expected an import path corresponding to a {typehint}", path)
+
+    # Module
+    elif typehint is ModuleType:
+        if serialize:
+            if isinstance(val, ModuleType):
+                val = val.__name__
+        elif not isinstance(val, ModuleType):
+            if not is_importable_module_path(val):
+                raise_unexpected_value("Expected an import path corresponding to a module", val)
+            if instantiate_classes:
+                val = import_module(val)
+
+    # UnionType and GenericAlias
+    elif typehint in type_expression_types:
+        if serialize:
+            if isinstance(val, typehint):
+                val = str(val)
+        elif not isinstance(val, typehint):
+            expected = f"Expected a string with a {type_expression_types[typehint]} type expression"
+            try:
+                type_expression = str_to_type_expression(val)
+            except Exception as ex:
+                raise_unexpected_value(expected, val, ex)
+            if not isinstance(type_expression, typehint):
+                raise_unexpected_value(expected, val)
+            val = type_expression
 
     # Union
     elif typehint_origin == Union:
@@ -2020,6 +2146,13 @@ def is_enum_type(annotation):
     )
 
 
+def is_module_type(annotation):
+    annotation = get_unaliased_type(annotation)
+    return annotation is ModuleType or (
+        get_typehint_origin(annotation) == Union and any(a is ModuleType for a in annotation.__args__)
+    )
+
+
 def is_callable_type(annotation):
     def is_callable(a):
         return (get_typehint_origin(a) or a) in callable_origin_types or a in callable_origin_types
@@ -2040,6 +2173,10 @@ def strip_module_names(string: str) -> str:
 
 
 def type_to_str(obj):
+    if obj is ModuleType:
+        return "ModuleType"
+    if obj in type_expression_types:
+        return type_expression_types[obj]
     if obj in {bool, tuple} or is_subclass(obj, (int, float, str, Path, Enum)):
         return obj.__name__
     return strip_module_names(str(obj)).replace("NoneType", "null")
