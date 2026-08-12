@@ -584,7 +584,10 @@ Some notes about this support are:
 
 - ``pydantic.SecretStr`` type is supported with the expected behavior of not
   serializing the actual value. There is also ``jsonargparse.typing.SecretStr``
-  to support the same behavior without the need of a dependency.
+  to support the same behavior without the need of a dependency. Since dumps
+  only have the mask ``**********`` instead of the actual secret, parsing this
+  mask as a secret fails, so that a config bootstrapped with ``--print_config``
+  is not used with the mask as the secret.
 
 - ``pydantic.FilePath`` and ``pydantic.DirectoryPath`` types are supported,
   running the corresponding pydantic validation when parsing. Arguments with
@@ -1186,6 +1189,12 @@ Parsing complex-valued points would be:
     >>> parser.add_argument("--point", type=Point2d[complex])  # doctest: +IGNORE_RESULT
     >>> parser.parse_args(["--point.x=(1+2j)"]).point
     Namespace(x=(1+2j), y=0.0)
+
+A ``TypeVar`` can't be used to validate, so when it is used as a type, e.g.
+``options: Optional[OptionsT] = None``, it is replaced by what it stands for:
+its PEP 696 ``default``, its constraints or its bound, in that order. When it
+has none of these, the value is accepted without validation and the help shows
+it as ``Unvalidated<...>``.
 
 
 .. _callable-type:
@@ -2250,11 +2259,16 @@ be accepted. In this case the config would be like:
     ``class_path`` and ``init_args`` if the corresponding parameter has type
     ``Any``, or when ``fail_untyped=False`` which defaults to type ``Any``.
 
-    If such a value looks like a subclass spec (has a ``class_path``) but cannot
-    be parsed as one, e.g. because the class fails to import, by default it is
-    left unchanged and a debug message is logged. Set
+    If a value looks like a subclass spec (has a ``class_path``) but cannot be
+    parsed as one, e.g. because the class fails to import, by default it is left
+    unchanged and a debug message is logged. Set
     ``validate_subclass_spec_in_any=True`` in :func:`.set_parsing_settings` to
-    make the parsing fail in this case instead.
+    make the parsing fail instead. Apart from ``Any`` and ``Unvalidated<...>``,
+    this also applies to dicts that don't validate their values, e.g.
+    ``dict[str, Any]``. For dicts the spec is only validated, since the value is
+    kept as a dict, which matters for unions such as ``Union[SomeClass,
+    dict[str, Any]]``, where a spec rejected by the class member would otherwise
+    be silently swallowed by the dict member.
 
 .. note::
 
