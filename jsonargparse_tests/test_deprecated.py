@@ -12,7 +12,7 @@ from importlib import import_module
 from inspect import getmodule as inspect_getmodule
 from io import StringIO
 from types import ModuleType
-from typing import Optional
+from typing import Any, Optional
 from unittest.mock import patch
 from warnings import catch_warnings
 
@@ -1200,6 +1200,46 @@ def test_deprecated_print_config_skip_null(parser):
     )
 
 
+def test_deprecated_print_config_default_name(monkeypatch):
+    monkeypatch.delenv("JSONARGPARSE_DEPRECATION_WARNINGS", raising=False)
+
+    # No warning when the config dest is "config".
+    parser = ArgumentParser(exit_on_error=False)
+    with catch_warnings(record=True) as w:
+        parser.add_argument("--config", action="config")
+    assert w == []
+
+    # No warning without JSONARGPARSE_DEPRECATION_WARNINGS=all, even with another dest.
+    parser = ArgumentParser(exit_on_error=False)
+    with catch_warnings(record=True) as w:
+        parser.add_argument("--cfg", action="config")
+    assert w == []
+
+    monkeypatch.setenv("JSONARGPARSE_DEPRECATION_WARNINGS", "all")
+
+    # No warning with all when the config dest is "config".
+    parser = ArgumentParser(exit_on_error=False)
+    with catch_warnings(record=True) as w:
+        parser.add_argument("--config", action="config")
+    assert w == []
+
+    # No warning when print_config already uses %s.
+    parser = ArgumentParser(exit_on_error=False, print_config="--print_%s")
+    with catch_warnings(record=True) as w:
+        parser.add_argument("--cfg", action="config")
+    assert w == []
+
+    # Warning with all when the config dest differs from "config".
+    parser = ArgumentParser(exit_on_error=False)
+    with catch_warnings(record=True) as w:
+        parser.add_argument("--cfg", action="config")
+    assert_deprecation_warn(
+        w,
+        message='become "--print_cfg"',
+        code='parser.add_argument("--cfg", action="config")',
+    )
+
+
 def test_subcommands_parse_string_first_implicit_subcommand(subcommands_parser):  # noqa: F811
     with catch_warnings(record=True) as w:
         cfg = subcommands_parser.parse_string('{"a": {"ap1": "ap1_cfg"}, "b": {"nums": {"val1": 2}}}')
@@ -1388,3 +1428,23 @@ def test_fail_untyped_false_required_parameter_deprecation(parser, monkeypatch):
     assert "In v5 the type will be set to Any but the parameter will remain required" in str(warnings[0].message)
 
     assert parser.get_defaults() == Namespace(a1=None, a2=None, b1=None, b2=None)
+
+
+def test_instantiate_subclass_spec_in_any_deprecation(parser):
+    shown_deprecation_warnings.clear()
+    parser.add_argument("--any", type=Any)
+    spec = {"class_path": "calendar.TextCalendar", "init_args": {"firstweekday": 2}}
+    cfg = parser.parse_args([f"--any={json.dumps(spec)}"])
+
+    with catch_warnings(record=True) as w:
+        init = parser.instantiate(cfg)
+    assert isinstance(init.any, Calendar)
+    assert init.any.firstweekday == 2
+    assert len(w) == 2
+    assert "will no longer be instantiated" in str(w[-1].message)
+    assert "instantiate_subclass_spec_in_any" in str(w[-1].message)
+
+    with catch_warnings(record=True) as w:
+        init = parser.instantiate(cfg)
+    assert isinstance(init.any, Calendar)
+    assert w == []
