@@ -12,7 +12,6 @@ from collections import OrderedDict, abc, defaultdict, deque
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from copy import deepcopy
-from datetime import date, datetime
 from enum import Enum
 from functools import partial, reduce
 from importlib import import_module
@@ -406,8 +405,8 @@ class ActionTypeHint(Action):
             return args
         typehint = kwargs.pop("type")
         if args[0].startswith("--") and ActionTypeHint.supports_append(typehint):
-            args = tuple(list(args) + [args[0] + "+"])
-        if get_registered_type(typehint) is None and _ActionHelpClassPath.get_help_types(typehint):
+            args = tuple(list(args) + [f"{a}+" for a in args if a.startswith("--")])
+        if get_registered_type(typehint) is None and get_help_types(typehint):
             help_option = f"--{args[0]}.help" if args[0][0] != "-" else f"{args[0]}.help"
             help_action = container.add_argument(help_option, action=_ActionHelpClassPath(typehint=typehint))
             if sub_add_kwargs:
@@ -655,13 +654,15 @@ class ActionTypeHint(Action):
             return ActionTypeHint(**kwargs)
         parser, cfg, val, opt_str = args
         if not (self.nargs == "?" and val is None):
-            if isinstance(opt_str, str) and opt_str.startswith(f"--{self.dest}."):
-                if opt_str.startswith(f"--{self.dest}.init_args."):
-                    sub_opt = opt_str[len(f"--{self.dest}.init_args.") :]
+            # the option string can be an alias of the dest, i.e. another accepted name for it
+            option = self.get_option_string_base(opt_str)
+            if option:
+                if opt_str.startswith(f"{option}.init_args."):
+                    sub_opt = opt_str[len(f"{option}.init_args.") :]
                 else:
-                    sub_opt = opt_str[len(f"--{self.dest}.") :]
+                    sub_opt = opt_str[len(f"{option}.") :]
                 val = NestedArg(key=sub_opt, val=val)
-            append = opt_str == f"--{self.dest}+"
+            append = isinstance(opt_str, str) and opt_str.endswith("+") and opt_str[:-1] in self.option_strings
             val = self._check_type_(val, append=append, cfg=cfg, mode=parser.parser_mode)
             if is_subclass_spec(val):
                 prev_val = cfg.get(self.dest)
@@ -673,6 +674,12 @@ class ActionTypeHint(Action):
                     )
         cfg.update(val, self.dest)
         return None
+
+    def get_option_string_base(self, opt_str) -> str | None:
+        """Returns the option string of which opt_str is a sub-option, e.g. '--x' for '--x.y'."""
+        if not isinstance(opt_str, str):
+            return None
+        return next((o for o in self.option_strings if opt_str.startswith(f"{o}.")), None)
 
     def _check_type(self, value, append=False, cfg=None, mode=None):
         islist = _is_action_value_list(self)
@@ -1028,6 +1035,10 @@ def resolve_module_annotations(module: str, annotations: dict, global_vars: dict
     return {k: resolve_forward_ref(v, global_vars) for k, v in annotations.items()}
 
 
+def is_typed_dict(typehint) -> bool:
+    return type(typehint) in typed_dict_meta_types
+
+
 def get_typed_dict_annotations(typed_dict, logger=None) -> dict:
     from ._postponed_annotations import get_global_vars, update_module_global_vars
 
@@ -1078,7 +1089,7 @@ def is_typed_dict_subtype(subtype, typed_dict, logger=None) -> bool:
     # TypedDicts don't support issubclass, so as specified in PEP 589 the check is done
     # structurally, i.e. the subtype must have all keys of the typed dict, with the same
     # types and requiredness.
-    if type(subtype) not in typed_dict_meta_types:
+    if not is_typed_dict(subtype):
         return False
     if subtype is typed_dict:
         return True
@@ -1181,13 +1192,14 @@ def adapt_typehints(
     if typehint == Any or isinstance(typehint, UnvalidatedType):
         type_val = type(val)
         if get_registered_type(type_val) or is_subclass(type_val, Enum):
-            val = adapt_typehints(val, type_val, **adapt_kwargs)
+            if not serialize:  # when serializing this is done by serialize_unvalidated
+                val = adapt_typehints(val, type_val, **adapt_kwargs)
         elif isinstance(val, str):
             with suppress(*get_loader_exceptions()):
                 val, _ = parse_value_or_config(val, enable_path=False, simple_types=True)
         val = adapt_classes_any(val, typehint, serialize, instantiate_classes, sub_add_kwargs, logger)
         if serialize:
-            val = serialize_unvalidated(val)
+            val = serialize_unvalidated(val, adapt_kwargs)
 
     # Literal
     elif typehint_origin in literal_types:
@@ -1248,7 +1260,7 @@ def adapt_typehints(
             val = import_object(val)
             if typehint in {Type, type}:
                 valid = isinstance(val, type)
-            elif type(subtypehints[0]) in typed_dict_meta_types:
+            elif is_typed_dict(subtypehints[0]):
                 valid = is_typed_dict_subtype(val, subtypehints[0], logger)
             else:
                 valid = is_subclass(val, subtypehints[0])
@@ -1399,7 +1411,7 @@ def adapt_typehints(
                     else:
                         kwargs["prev_val"] = None
                 val[k] = adapt_typehints(v, subtypehints[1], **kwargs)
-        if type(typehint) in typed_dict_meta_types:
+        if is_typed_dict(typehint):
             dict_annotations = get_typed_dict_annotations(typehint, logger)
             required_keys = get_typed_dict_required_keys(typehint, dict_annotations)
             missing_keys = required_keys - val.keys()
@@ -1540,6 +1552,8 @@ def adapt_typehints(
                 return val_class  # importable instance
             if is_protocol(val_class):
                 raise_unexpected_value(f"Expected an instantiatable class, but {val['class_path']} is a protocol")
+            if inspect.isabstract(val_class):
+                raise_unexpected_value(f"Expected an instantiatable class, but {val['class_path']} is abstract")
             if (
                 is_subclasses_disabled(typehint)
                 and inspect.isclass(val_class)
@@ -1930,6 +1944,16 @@ def get_subclass_or_closed_types(typehint, also_lists=False, callable_return=Fal
     return types or None
 
 
+def is_single_help_type(typehint, typehint_origin):
+    return is_typed_dict(typehint) or is_single_subclass_or_closed_type(typehint, typehint_origin)
+
+
+def get_help_types(typehint):
+    """Types in a type hint for which a --*.help option shows the accepted arguments."""
+    types = tuple(yield_class_types(typehint, is_single=is_single_help_type, also_lists=True, callable_return=True))
+    return types or None
+
+
 def get_subclass_names(typehint, callable_return=False):
     return tuple(
         t.__name__
@@ -1960,7 +1984,7 @@ def adapt_partial_callable_class(callable_type, subclass_spec):
     return subclass_spec, partial_skip_args
 
 
-def get_all_subclass_paths(cls: type) -> list[str]:
+def get_all_subclass_paths(cls: type, include_abstract: bool = False) -> list[str]:
     subclass_list = []
 
     def is_local(cl):
@@ -1981,7 +2005,7 @@ def get_all_subclass_paths(cls: type) -> list[str]:
             return
         if is_local(cl) or is_subclass(cl, _LazyInitBaseClass):
             return
-        if not (inspect.isabstract(cl) or is_private(class_path) or is_protocol(cl)):
+        if not ((inspect.isabstract(cl) and not include_abstract) or is_private(class_path) or is_protocol(cl)):
             if class_path in subclass_list:
                 return
             subclass_list.append(class_path)
@@ -2010,10 +2034,18 @@ def resolve_class_path_by_name(cls: type | tuple[type], name: str) -> str:
                 if "." in class_path:
                     break
             return class_path
-        subclass_dict = defaultdict(list)
-        for subclass in get_all_subclass_paths(cls):
-            subclass_name = subclass.rsplit(".", 1)[1]
-            subclass_dict[subclass_name].append(subclass)
+
+        def get_subclass_dict(include_abstract: bool) -> dict:
+            subclass_dict = defaultdict(list)
+            for subclass in get_all_subclass_paths(cls, include_abstract=include_abstract):
+                subclass_name = subclass.rsplit(".", 1)[1]
+                subclass_dict[subclass_name].append(subclass)
+            return subclass_dict
+
+        subclass_dict = get_subclass_dict(include_abstract=False)
+        if name not in subclass_dict:
+            # abstract classes are not valid choices, but resolving them gives a more informative error
+            subclass_dict = get_subclass_dict(include_abstract=True)
         if name in subclass_dict:
             name_subclasses = subclass_dict[name]
             if len(name_subclasses) > 1:
@@ -2246,7 +2278,7 @@ def validate_subclass_spec_in_mapping(val, typehint, subtypehints, sub_add_kwarg
     """
     if not get_parsing_setting("validate_subclass_spec_in_any") or not is_subclass_spec(val):
         return
-    if type(typehint) in typed_dict_meta_types:
+    if is_typed_dict(typehint):
         return
     if subtypehints is not None and not (subtypehints[1] == Any or isinstance(subtypehints[1], UnvalidatedType)):
         return
@@ -2554,34 +2586,62 @@ def serialize_class_instance(val):
     return val
 
 
-# The types that the config formats represent natively. Values of any other type require a
-# serializer, which for the types that are not validated there is none, see serialize_unvalidated.
-representable_types = (NoneType, bool, int, float, str, bytes, date, datetime)
+def typehint_from_value(val):
+    """Derives a type hint from a value, so that adapt_typehints is able to serialize it.
+
+    Containers are derived as a type hint of ``Any`` items, so that the items are
+    serialized the same as the value itself. ``None`` is returned for the values
+    that no supported or registered type represents.
+    """
+    if isinstance(val, dict):
+        return Dict[Any, Any]
+    if isinstance(val, list):
+        return List[Any]
+    if isinstance(val, tuple):
+        return Tuple[Any, ...]
+    if isinstance(val, (set, frozenset)):
+        return Set[Any]
+    type_val = type(val)
+    if type_val in leaf_types or get_registered_type(type_val) or is_subclass(type_val, Enum):
+        return type_val
+    return None
 
 
-def serialize_unvalidated(val):
-    """Serializes the class instances in the value of a type that is not validated.
+def serialize_unvalidated(val, adapt_kwargs):
+    """Serializes the value of a type that is not validated.
 
-    Values of an Any or Unvalidated type don't have a serializer, so an instance
-    that a config format can't represent would make dump fail. Instead they are
-    serialized the same as the instances given for a subclass type, i.e. as an
-    import path when the value can be imported back, otherwise as a message that
-    says that it was not serializable.
+    Values of an Any or Unvalidated type don't have a type hint to serialize
+    them with, so one is derived from the value itself and the serialization is
+    delegated to adapt_typehints. Values that no type represents are serialized
+    the same as the instances given for a subclass type, i.e. as an import path
+    when the value can be imported back, otherwise as a message that says that it
+    was not serializable.
+
+    Parsing back has no type hint either, thus a value only round-trips when the
+    config format represents its type. A warning is given when it doesn't.
     """
     if isinstance(val, Namespace):
         # e.g. a subclass spec that adapt_classes_any already serialized
         for key, subval in val.items(branches=True, nested=False):
-            val[key] = serialize_unvalidated(subval)
+            val[key] = serialize_unvalidated(subval, adapt_kwargs)
         return val
+    typehint = typehint_from_value(val)
+    if typehint is None:
+        return serialize_class_instance(val)
     if isinstance(val, dict):
-        return {k: serialize_unvalidated(v) for k, v in val.items()}
-    if isinstance(val, (list, tuple)):
-        return [serialize_unvalidated(v) for v in val]
-    if isinstance(val, (set, frozenset)):
-        return {serialize_unvalidated(v) for v in val}
-    if isinstance(val, representable_types):
-        return val
-    return serialize_class_instance(val)
+        adapt_val = dict(val)  # adapt_typehints serializes the items in place, so give it a copy
+    elif isinstance(val, list):
+        adapt_val = list(val)
+    else:
+        adapt_val = val
+    serialized = adapt_typehints(adapt_val, typehint, **adapt_kwargs)
+    if type(serialized) is not type(val):
+        warning(
+            f"Dump of a value that does not round-trip: a {type(val).__name__} is serialized as "
+            f"{type(serialized).__name__} and, since the type is not validated, parsing it back "
+            f"gives a {type(serialized).__name__}. Value: {val}"
+        )
+    return serialized
 
 
 def callable_instances(cls: type):

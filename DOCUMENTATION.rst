@@ -515,7 +515,9 @@ Some notes about this support are:
 - Types that use components imported inside ``TYPE_CHECKING`` blocks are
   supported.
 
-- Resolving of forward references in types is supported.
+- Resolving of forward references in types is supported. This includes names
+  that are only defined in the body of the class that owns the method, e.g. a
+  nested class referred to without qualifying it.
 
 - Fully supported types are: ``str``, ``bool`` (more details in
   :ref:`boolean-arguments`), ``int``, ``float``, ``Decimal``, ``complex``,
@@ -531,12 +533,19 @@ Some notes about this support are:
 - ``dict``, ``Mapping``, ``MutableMapping``, ``MappingProxyType``,
   ``OrderedDict``, and ``TypedDict`` are supported but only with ``str`` or
   ``int`` keys. ``Required`` and ``NotRequired`` are also supported for
-  fine-grained specification of required/optional ``TypedDict`` keys.
-  ``Unpack`` is supported with ``TypedDict`` for more precise ``**kwargs``
-  typing as described in PEP `692 <https://peps.python.org/pep-0692/>`__.
-  For more details see :ref:`dict-items`. A ``TypedDict`` can also be used as
-  the argument of ``type``, e.g. ``type[SomeTypedDict]``, in which case the
-  value is an import path to a class. Since ``TypedDict`` classes don't support
+  fine-grained specification of required/optional ``TypedDict`` keys. ``Unpack``
+  is supported with ``TypedDict`` for more precise ``**kwargs`` typing as
+  described in PEP `692 <https://peps.python.org/pep-0692/>`__. For more details
+  see :ref:`dict-items`. The keys that a ``TypedDict`` argument accepts are
+  shown by a ``--*.help`` option, e.g. ``--data.help``. This option receives no
+  value, unless the ``TypedDict`` is in a union with other types that have their
+  own help, in which case the value is the name of the typed dict, e.g.
+  ``--data.help SomeTypedDict``. A ``TypedDict`` is also accepted by
+  :meth:`add_class_arguments <.ArgumentParser.add_class_arguments>`, which adds
+  one argument per key and on :meth:`instantiate <.ArgumentParser.instantiate>`
+  gives the corresponding dict. A ``TypedDict`` can also be used as the argument
+  of ``type``, e.g. ``type[SomeTypedDict]``, in which case the value is an
+  import path to a class. Since ``TypedDict`` classes don't support
   ``issubclass``, the given class is accepted when it is structurally
   compatible, as specified in PEP `589 <https://peps.python.org/pep-0589/>`__,
   i.e. it has all the keys of the expected ``TypedDict``, with the same types
@@ -726,13 +735,21 @@ must still be a list, though its items are not validated. Likewise, in a
 ``Union`` only the subtypes that can't be validated accept any value, the others
 are still validated as usual.
 
-Since there is no type to serialize with, a value of one of these parameters
-that a config format can't represent, e.g. a default that is an arbitrary
-object, is serialized in :meth:`dump <.ArgumentParser.dump>` and
-``--print_config`` the same as the instances given for a :ref:`subclass type
-<sub-classes>`. That is, as an import path when the value can be imported back,
-and otherwise as a message that says that it was not serializable, in which case
-a warning is also raised. The same applies to arguments typed as ``Any``.
+Since there is no type to serialize with, in :meth:`dump <.ArgumentParser.dump>`
+and ``--print_config`` a type is derived from the value itself, so that the
+value is serialized the same as it would be for an argument of that type. A
+value of a type that jsonargparse doesn't support, e.g. a default that is an
+arbitrary object, is serialized the same as the instances given for a
+:ref:`subclass type <sub-classes>`. That is, as an import path when the value
+can be imported back, and otherwise as a message that says that it was not
+serializable, in which case a warning is also raised.
+
+Parsing a dump back has no type to validate with either, so only the values that
+the config formats represent round-trip. For instance, a ``set`` is serialized
+as a list and parses back as a list, and an ``Enum`` member is serialized as its
+name and parses back as a string. A warning is raised for each dumped value that
+loses its type this way. All of the above equally applies to arguments typed as
+``Any``.
 
 
 .. _restricted-numbers:
@@ -2136,6 +2153,46 @@ the stubs. In these cases in the parser help the default is shown as
 ``Unknown<stubs-resolver>`` and not included in :meth:`get_defaults
 <.ArgumentParser.get_defaults>` or the output of ``--print_config``.
 
+.. _parameter-aliases:
+
+Parameter aliases
+^^^^^^^^^^^^^^^^^
+
+Pydantic and attrs allow giving a field a name that is different from the
+attribute name, an alias: pydantic's ``alias``/``validation_alias`` and attrs'
+``alias``. The resolvers take these aliases into account, so that a parser
+accepts the same names as the class itself.
+
+When the framework accepts both names, e.g. a pydantic model with
+``populate_by_name``, the alias is accepted as an additional option and config
+key. The attribute name is the one used in the parsed namespace, in
+``--print_config`` and in dumps:
+
+.. doctest:: parameter_aliases
+
+    >>> from pydantic import BaseModel, ConfigDict, Field
+
+    >>> class Client(BaseModel):
+    ...     model_config = ConfigDict(populate_by_name=True)
+    ...     api_key: str = Field(default="", alias="key")
+    ...
+
+    >>> parser = ArgumentParser()
+    >>> parser.add_class_arguments(Client, "client")  # doctest: +IGNORE_RESULT
+    >>> parser.parse_args(["--client.key=abc"])
+    Namespace(client=Namespace(api_key='abc'))
+
+When the framework only accepts the alias, e.g. the same model without
+``populate_by_name``, the alias is the name used everywhere, since giving the
+attribute name would not instantiate the class as expected.
+
+Aliases are not supported for a parameter whose type is a subclasses-disabled
+type added as a group of arguments, since then the name is a prefix of several
+arguments instead of a single option string. In this case only the attribute
+name is accepted. Enabling subclasses for the type, see
+:ref:`enable-disable-subclasses`, makes it a single argument, and then its alias
+is accepted as well.
+
 
 .. _dependency-injection:
 
@@ -2283,6 +2340,12 @@ be accepted. In this case the config would be like:
     It is also possible to provide to ``class_path`` a function that has as return
     type a class. The accepted ``init_args`` would be the parameters of that
     function.
+
+.. note::
+
+    Abstract classes, i.e. classes that have abstract methods, are not accepted
+    as ``class_path`` value, since they can't be instantiated. For the same
+    reason they are not included in the known subclasses shown in the help.
 
 
 .. _sub-config-files:
@@ -2715,6 +2778,11 @@ accepted values are the same. A subclass spec is accepted, though only with the
 "init_args": {"number": 8}}``. The ``class_path`` of a subclass is not accepted,
 unless subclass support is enabled for the type as described next.
 
+Abstract dataclass-like types are an exception. A class that has abstract
+methods or that inherits from ``abc.ABC`` is not intended to be instantiated
+from its own fields, so for these types subclass support is enabled by default,
+i.e. only the ``class_path`` of an implementation is accepted.
+
 
 .. _enable-disable-subclasses:
 
@@ -2736,7 +2804,8 @@ precedence over those in ``subclasses_disabled``. If a function name is given to
 ``subclasses_enabled``, it must correspond to a function previously registered
 in ``subclasses_disabled``; in this case, the effect is to unregister it. By
 default, the following disabling functions are registered: ``is_pure_dataclass``,
-``is_pydantic_model``, ``is_attrs_class``, and ``is_final_class``.
+``is_pydantic_model``, ``is_attrs_class``, and ``is_final_class``. These
+functions are not applied to abstract classes, see above.
 
 Some examples. Since ``subclasses_enabled`` takes precedence, it is possible to
 keep subclass support disabled for dataclasses, but enable it for a specific
@@ -3382,6 +3451,17 @@ giving as guidance which of the subclasses accepts it. An example would be:
     --cls.param1    --cls.param2
     $ example.py --cls other.module.SubclassA --cls.param2 <TAB><TAB>
     Expected type: int; Accepted by subclasses: SubclassA
+
+Analogously, for dataclass-like types and ``TypedDict``, the fields or keys are
+completed, as well as the values that they accept, e.g.:
+
+.. code-block:: bash
+
+    $ example.py --data.<TAB><TAB>
+    --data.verbose    --data.mode
+    $ example.py --data.verbose <TAB><TAB>
+    Expected type: bool; 2/2 matched choices
+    true  false
 
 argcomplete
 -----------

@@ -9,6 +9,7 @@ import sys
 import time
 import uuid
 from collections import OrderedDict, abc, deque
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date
 from enum import Enum
@@ -43,7 +44,7 @@ from typing import (
     Union,
 )
 from unittest import mock
-from warnings import catch_warnings
+from warnings import catch_warnings, simplefilter
 
 import pytest
 
@@ -60,7 +61,6 @@ from jsonargparse._typehints import (
     is_optional,
     is_typed_dict_subtype,
     replace_unvalidatable_typehints,
-    serialize_unvalidated,
     type_to_str,
 )
 from jsonargparse._util import get_import_path
@@ -78,6 +78,8 @@ from jsonargparse_tests.conftest import (
     json_or_yaml_dump,
     json_or_yaml_load,
     parser_modes,
+    skip_if_docstring_parser_unavailable,
+    skip_if_no_pyyaml,
 )
 
 
@@ -238,10 +240,28 @@ def test_type_any(parser):
     assert "[[[" == parser.parse_args(["--any=[[["]).any
 
 
+@contextmanager
+def assert_dump_warnings(*expected):
+    """Asserts that the dump gives exactly one warning containing each of the given fragments."""
+    with catch_warnings(record=True) as recorded:
+        simplefilter("always")  # otherwise repeated identical warnings are only recorded once
+        yield
+    messages = [str(w.message) for w in recorded]
+    for fragment in set(expected):
+        assert sum(1 for m in messages if fragment in m) == expected.count(fragment), f"{fragment!r} in {messages}"
+    assert len(messages) == len(expected), messages
+
+
+def serialized_as(from_type, to_type):
+    return f"a {from_type} is serialized as {to_type}"
+
+
 def test_type_any_dump(parser):
     parser.add_argument("--any", type=Any, default=EnumABC.B)
     cfg = parser.parse_args([])
-    assert {"any": "B"} == json_or_yaml_load(parser.dump(cfg))
+    with assert_dump_warnings(serialized_as("EnumABC", "str")):
+        dump = parser.dump(cfg)
+    assert {"any": "B"} == json_or_yaml_load(dump)
 
 
 class NotSerializable:
@@ -260,12 +280,11 @@ def test_type_any_dump_not_serializable(parser):
     parser.add_argument("--items", type=Any, default=[NotSerializable(), 1])
     parser.add_argument("--nested", type=Any, default={"a": (NotSerializable(),)})
     cfg = parser.parse_args([])
-    with catch_warnings(record=True) as w:
+    with assert_dump_warnings(*[unable_to_serialize] * 3, serialized_as("tuple", "list")):
         dump = json_or_yaml_load(parser.dump(cfg))
     assert dump["any"] == unable_to_serialize
     assert dump["items"] == [unable_to_serialize, 1]
     assert dump["nested"] == {"a": [unable_to_serialize]}
-    assert unable_to_serialize in str(w[0].message)
 
 
 def test_type_any_dump_importable(parser):
@@ -279,17 +298,102 @@ def test_type_any_dump_importable(parser):
     }
 
 
-def test_serialize_unvalidated_containers():
+def test_type_any_dump_containers(parser):
+    # a type hint is derived from the value, so the containers are serialized as any
+    # other container and their items the same as any other unvalidated value
     import_path = f"{__name__}.not_serializable"
-    # the container types that a config format represents are kept, only the items serialized
-    assert serialize_unvalidated({"a": not_serializable}) == {"a": import_path}
-    assert serialize_unvalidated([not_serializable]) == [import_path]
-    assert serialize_unvalidated((not_serializable,)) == [import_path]
-    assert serialize_unvalidated({not_serializable}) == {import_path}
-    assert serialize_unvalidated(frozenset({not_serializable})) == {import_path}
-    # values that a config format represents natively are left as is
-    representable = [1, "a", 2.3, True, None, date(2020, 1, 2)]
-    assert serialize_unvalidated(representable) == representable
+    parser.add_argument("--dict", type=Any, default={"a": not_serializable})
+    parser.add_argument("--list", type=Any, default=[not_serializable])
+    parser.add_argument("--tuple", type=Any, default=(not_serializable,))
+    parser.add_argument("--set", type=Any, default={not_serializable})
+    parser.add_argument("--frozenset", type=Any, default=frozenset({not_serializable}))
+    cfg = parser.parse_args([])
+    lost_types = [serialized_as(t, "list") for t in ["tuple", "set", "frozenset"]]
+    with assert_dump_warnings(*lost_types):
+        dump = json_or_yaml_load(parser.dump(cfg))
+    assert dump == {
+        # the containers that a config format represents are kept
+        "dict": {"a": import_path},
+        "list": [import_path],
+        # the ones it doesn't represent become a list
+        "tuple": [import_path],
+        "set": [import_path],
+        "frozenset": [import_path],
+    }
+
+
+@skip_if_no_pyyaml
+def test_type_any_dump_non_string_dict_keys(parser):
+    # the keys of a dict are not validated either, so they are not coerced to str
+    parser.add_argument("--any", type=Any, default={1: "a"})
+    cfg = parser.parse_args([])
+    assert parser.dump(cfg, format="yaml") == "any:\n  1: a\n"
+
+
+def test_type_any_dump_set(parser):
+    # a set is not representable by the config formats, so it is dumped as a list
+    parser.add_argument("--set", type=Any, default={1})
+    parser.add_argument("--frozen", type=Any, default=frozenset({2}))
+    parser.add_argument("--nested", type=Any, default={"a": {3}})
+    cfg = parser.parse_args([])
+    lost_types = [serialized_as("set", "list")] * 2 + [serialized_as("frozenset", "list")]
+    with assert_dump_warnings(*lost_types):
+        dump = json_or_yaml_load(parser.dump(cfg))
+    assert dump == {"set": [1], "frozen": [2], "nested": {"a": [3]}}
+
+
+def test_type_any_dump_registered_type(parser):
+    # registered types serialize the same as when they are the type of the argument
+    parser.add_argument("--path", type=Any, default=Path_fr(__file__))
+    parser.add_argument("--bytes", type=Any, default=b"ab")
+    cfg = parser.parse_args([])
+    with assert_dump_warnings(serialized_as("Path_fr", "str"), serialized_as("bytes", "str")):
+        dump = json_or_yaml_load(parser.dump(cfg))
+    assert dump == {"path": __file__, "bytes": "YWI="}
+
+
+def test_type_any_dump_date_not_serializable(parser):
+    # the loaders don't parse timestamps, so a date is not a type that the config
+    # formats represent, even though yaml is able to write one
+    parser.add_argument("--date", type=Any, default=date(2020, 1, 2))
+    cfg = parser.parse_args([])
+    with assert_dump_warnings("Unable to serialize instance 2020-01-02"):
+        dump = json_or_yaml_load(parser.dump(cfg))
+    assert dump == {"date": "Unable to serialize instance 2020-01-02"}
+
+
+def test_type_any_dump_not_round_trippable_warns(parser):
+    # there is no type hint to rebuild the value with, so warn when the type is lost
+    parser.add_argument("--set", type=Any, default={1})
+    parser.add_argument("--enum", type=Any, default=EnumABC.B)
+    cfg = parser.parse_args([])
+    with catch_warnings(record=True) as w:
+        parser.dump(cfg)
+    messages = [str(x.message) for x in w]
+    assert len(messages) == 2
+    assert all("does not round-trip" in m for m in messages)
+    assert any(serialized_as("set", "list") in m and "Value: {1}" in m for m in messages)
+    assert any(serialized_as("EnumABC", "str") in m and "Value: EnumABC.B" in m for m in messages)
+
+
+def test_type_any_dump_round_trippable_no_warn(parser):
+    # the values that the config formats represent parse back the same, so no warning
+    parser.add_argument("--any", type=Any, default={"a": [1, 2.3, "b", True, None]})
+    cfg = parser.parse_args([])
+    with assert_dump_warnings():
+        dump = parser.dump(cfg)
+    assert json_or_yaml_load(dump) == {"any": {"a": [1, 2.3, "b", True, None]}}
+
+
+def test_type_any_dump_does_not_modify_config(parser):
+    # serializing must not replace the items of the containers that the value is made of
+    default = ({"a": {1}},)
+    parser.add_argument("--any", type=Any, default=default)
+    cfg = parser.parse_args([])
+    with assert_dump_warnings(serialized_as("tuple", "list"), serialized_as("set", "list")):
+        parser.dump(cfg)
+    assert cfg.any == default
+    assert default == ({"a": {1}},)
 
 
 def test_type_typehint_without_arg(parser):
@@ -946,6 +1050,110 @@ def test_typeddict_with_required_arg(parser):
     ctx.match("Expected a <class 'int'>")
 
 
+# TypedDict --*.help tests
+
+
+class HelpTypedDict(TypedDict):
+    """Data for the help.
+
+    Args:
+        a: the a
+        b: the b
+    """
+
+    a: int
+    b: str
+
+
+class HelpNotTotalTypedDict(TypedDict, total=False):
+    x: float
+
+
+def test_typeddict_help(parser):
+    parser.add_argument("--data", type=HelpTypedDict)
+    help_str = get_parser_help(parser)
+    assert "--data.help" in help_str
+    assert "Show the help for HelpTypedDict and exit" in help_str
+    assert "CLASS_PATH_OR_NAME" not in help_str
+    help_str = get_parse_args_stdout(parser, ["--data.help"])
+    assert f"Help for --data.help={__name__}.HelpTypedDict" in help_str
+    assert "--data.a A" in help_str
+    assert "(required, type: int)" in help_str
+    assert "--data.b B" in help_str
+    assert "(required, type: str)" in help_str
+
+
+@skip_if_docstring_parser_unavailable
+def test_typeddict_help_docstrings(parser):
+    parser.add_argument("--data", type=HelpTypedDict)
+    help_str = get_parse_args_stdout(parser, ["--data.help"])
+    assert "Data for the help:" in help_str
+    assert "the a (required, type: int)" in help_str
+    assert "the b (required, type: str)" in help_str
+
+
+def test_optional_typeddict_help_not_required_keys(parser):
+    parser.add_argument("--data", type=Optional[HelpNotTotalTypedDict])
+    assert "--data.help" in get_parser_help(parser)
+    help_str = get_parse_args_stdout(parser, ["--data.help"])
+    assert f"Help for --data.help={__name__}.HelpNotTotalTypedDict" in help_str
+    assert "--data.x X" in help_str
+    assert "(type: float)" in help_str
+
+
+def test_list_typeddict_help(parser):
+    parser.add_argument("--data", type=List[HelpTypedDict])
+    help_str = get_parse_args_stdout(parser, ["--data.help"])
+    assert f"Help for --data.help={__name__}.HelpTypedDict" in help_str
+    assert "--data.a A" in help_str
+
+
+class HelpTypedDictClass:
+    def __init__(self, data: Optional[HelpTypedDict] = None):
+        pass  # pragma: no cover
+
+
+def test_typeddict_class_parameter_help(parser):
+    parser.add_class_arguments(HelpTypedDictClass, "cls")
+    assert "--cls.data.help" in get_parser_help(parser)
+    help_str = get_parse_args_stdout(parser, ["--cls.data.help"])
+    assert f"Help for --cls.data.help={__name__}.HelpTypedDict" in help_str
+    assert "--cls.data.a A" in help_str
+    assert "--cls.data.b B" in help_str
+
+
+def test_typeddict_union_typeddicts_help(parser):
+    parser.add_argument("--val", type=Union[HelpTypedDict, HelpNotTotalTypedDict])
+    help_str = get_parser_help(parser)
+    assert "--val.help NAME" in help_str
+    assert "Show the help for the given typed dict" in help_str
+    assert "HelpTypedDict" in help_str
+    assert "HelpNotTotalTypedDict" in help_str
+    help_str = get_parse_args_stdout(parser, ["--val.help=HelpNotTotalTypedDict"])
+    assert f"Help for --val.help={__name__}.HelpNotTotalTypedDict" in help_str
+    assert "--val.x X" in help_str
+
+
+def test_typeddict_union_class_help(parser):
+    parser.add_argument("--val", type=Union[HelpTypedDict, BaseC])
+    help_str = get_parser_help(parser)
+    assert "--val.help CLASS_PATH_OR_NAME" in help_str
+    assert "Show the help for the given class or typed dict" in help_str
+    help_str = get_parse_args_stdout(parser, ["--val.help=HelpTypedDict"])
+    assert f"Help for --val.help={__name__}.HelpTypedDict" in help_str
+    assert "--val.a A" in help_str
+    help_str = get_parse_args_stdout(parser, [f"--val.help={__name__}.SubC"])
+    assert f"Help for --val.help={__name__}.SubC" in help_str
+    assert "--val.p P" in help_str
+
+
+def test_typeddict_union_help_unexpected_name(parser):
+    parser.add_argument("--val", type=Union[HelpTypedDict, HelpNotTotalTypedDict])
+    with pytest.raises(ArgumentError) as ctx:
+        parser.parse_args(["--val.help=Unexpected"])
+    ctx.match('"Unexpected" is not a typed dict')
+
+
 # type[TypedDict] tests. TypedDicts don't support issubclass, so the check is structural.
 
 
@@ -1405,6 +1613,10 @@ if Unpack:  # and Required and NotRequired
         def __init__(self, **kwargs) -> None:
             super().__init__(**kwargs)  # pragma: no cover
 
+    class UnpackDocumentedClass:
+        def __init__(self, **kwargs: Unpack[HelpTypedDict]) -> None:
+            pass  # pragma: no cover
+
 
 @pytest.mark.skipif(not Unpack, reason="Unpack introduced in python 3.11 or backported in typing_extensions")
 @pytest.mark.parametrize(["init_args"], [({"a": 1},), ({"a": 2, "b": None},), ({"a": 3, "b": 1},)])
@@ -1436,6 +1648,15 @@ def test_unpack_typeddict_wrappers_removed_from_help(parser):
     assert "NotRequired" not in help_str
     assert "(required, type: int)" in help_str
     assert "(type: int)" in help_str
+
+
+@skip_if_docstring_parser_unavailable
+@pytest.mark.skipif(not Unpack, reason="Unpack introduced in python 3.11 or backported in typing_extensions")
+def test_unpack_typeddict_key_descriptions_in_help(parser):
+    parser.add_class_arguments(UnpackDocumentedClass, "cls")
+    help_str = get_parser_help(parser)
+    assert "the a (required, type: int)" in help_str
+    assert "the b (required, type: str)" in help_str
 
 
 @pytest.mark.skipif(not Unpack, reason="Unpack introduced in python 3.11 or backported in typing_extensions")
