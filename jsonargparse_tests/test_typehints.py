@@ -28,6 +28,7 @@ from typing import (
     FrozenSet,
     Generic,
     Iterable,
+    Iterator,
     List,
     Literal,
     Mapping,
@@ -240,6 +241,27 @@ def test_type_any(parser):
     assert "[[[" == parser.parse_args(["--any=[[["]).any
 
 
+@parser_modes
+def test_type_object(parser):
+    # object is the top of the class hierarchy, thus like Any it accepts any value
+    parser.add_argument("--obj", type=object)
+    assert "abc" == parser.parse_args(["--obj=abc"]).obj
+    assert 123 == parser.parse_args(["--obj=123"]).obj
+    assert 5.6 == parser.parse_args(["--obj=5.6"]).obj
+    assert [7, 8] == parser.parse_args(["--obj=[7, 8]"]).obj
+    assert {"a": 0, "b": 1} == parser.parse_args(['--obj={"a":0, "b":1}']).obj
+    assert True is parser.parse_args(["--obj=true"]).obj
+    assert None is parser.parse_args(["--obj=null"]).obj
+
+
+def test_type_object_dump(parser):
+    parser.add_argument("--obj", type=object, default=EnumABC.B)
+    cfg = parser.parse_args([])
+    with assert_dump_warnings(serialized_as("EnumABC", "str")):
+        dump = parser.dump(cfg)
+    assert {"obj": "B"} == json_or_yaml_load(dump)
+
+
 @contextmanager
 def assert_dump_warnings(*expected):
     """Asserts that the dump gives exactly one warning containing each of the given fragments."""
@@ -423,6 +445,21 @@ def test_type_typehint_with_arg(parser):
     pytest.raises(ArgumentError, lambda: parser.parse_args(["--cls=uuid.UUID"]))
 
 
+def test_type_typehint_any_arg(parser):
+    parser.add_argument("--cls", type=type[Any])
+    # every class is a type[Any], the same as for type without an argument
+    cfg = parser.parse_args(["--cls=uuid.UUID"])
+    assert cfg.cls is uuid.UUID
+    assert json_or_yaml_load(parser.dump(cfg)) == {"cls": "uuid.UUID"}
+    pytest.raises(ArgumentError, lambda: parser.parse_args(["--cls=time.time"]))
+
+
+def test_type_typehint_object_arg(parser):
+    parser.add_argument("--cls", type=type[object])
+    assert parser.parse_args(["--cls=uuid.UUID"]).cls is uuid.UUID
+    pytest.raises(ArgumentError, lambda: parser.parse_args(["--cls=time.time"]))
+
+
 def test_type_typehint_help_known_subclasses(parser):
     parser.add_argument("--cls", type=Type[BaseC])
     help_str = get_parser_help(parser)
@@ -462,18 +499,51 @@ def test_type_typehint_constrained_typevar_arg(parser):
 # typevar as the type itself tests
 
 
-class TypeVarOptions(TypedDict, total=False):
+class TypeVarTypedDict(TypedDict, total=False):
     temperature: float
 
 
-BoundTypedDictVar = TypeVar("BoundTypedDictVar", bound=TypeVarOptions)
+BoundTypedDictVar = TypeVar("BoundTypedDictVar", bound=TypeVarTypedDict)
+
+GenericVar = TypeVar("GenericVar")
+
+# a generic TypedDict requires python 3.11 or later, or typing_extensions
+generic_typed_dict_support = sys.version_info >= (3, 11)
+skip_if_no_generic_typed_dict = pytest.mark.skipif(
+    not generic_typed_dict_support, reason="generic TypedDict introduced in python 3.11"
+)
+
+if generic_typed_dict_support:
+
+    class GenericTypedDict(TypedDict, Generic[GenericVar], total=False):
+        """Generic options.
+
+        Args:
+            temperature: How random.
+            extra: Anything else.
+        """
+
+        temperature: float
+        stop: List[str]
+        extra: GenericVar
+        extras: List[GenericVar]
+
+    class InheritsSubscriptedTypedDict(GenericTypedDict[int], total=False):
+        """Inherits subscripted options."""
+
+        name: str
+
+    class InheritsGenericTypedDict(GenericTypedDict[GenericVar], total=False):
+        """Inherits generic options."""
+
+        other: GenericVar
 
 
 def test_typevar_bound_argument(parser):
     parser.add_argument("--options", type=Optional[BoundTypedDictVar])
     assert parser.parse_args(['--options={"temperature": 0.5}']).options == {"temperature": 0.5}
     pytest.raises(ArgumentError, lambda: parser.parse_args(['--options={"unknown": 1}']))
-    assert f"(type: {type_to_str(Optional[TypeVarOptions])}, default: null)" in get_parser_help(parser)
+    assert f"(type: {type_to_str(Optional[TypeVarTypedDict])}, default: null)" in get_parser_help(parser)
 
 
 def function_typevar_bound(options: Optional[BoundTypedDictVar] = None):
@@ -508,11 +578,81 @@ def test_typevar_unbound_signature_parameter(parser):
 def test_typevar_default_argument(parser):
     from typing_extensions import TypeVar as TypeVarExt
 
-    default_var = TypeVarExt("default_var", bound=Mapping[str, Any], default=TypeVarOptions)
+    default_var = TypeVarExt("default_var", bound=Mapping[str, Any], default=TypeVarTypedDict)
     parser.add_argument("--options", type=Optional[default_var])
     assert parser.parse_args(['--options={"temperature": 0.5}']).options == {"temperature": 0.5}
     pytest.raises(ArgumentError, lambda: parser.parse_args(['--options={"unknown": 1}']))
-    assert f"(type: {type_to_str(Optional[TypeVarOptions])}, default: null)" in get_parser_help(parser)
+    assert f"(type: {type_to_str(Optional[TypeVarTypedDict])}, default: null)" in get_parser_help(parser)
+
+
+@pytest.mark.skipif(not typing_extensions_support, reason="typing_extensions package is required")
+def test_typevar_default_forward_ref(parser):
+    from typing_extensions import TypeVar as TypeVarExt
+
+    default_var = TypeVarExt("default_var", bound=Mapping[str, Any], default="TypeVarTypedDict")
+    parser.add_argument("--options", type=Optional[default_var])
+    assert parser.parse_args(['--options={"temperature": 0.5}']).options == {"temperature": 0.5}
+    pytest.raises(ArgumentError, lambda: parser.parse_args(['--options={"unknown": 1}']))
+    assert f"(type: {type_to_str(Optional[TypeVarTypedDict])}, default: null)" in get_parser_help(parser)
+
+
+@pytest.mark.skipif(not typing_extensions_support, reason="typing_extensions package is required")
+@skip_if_no_generic_typed_dict
+def test_typevar_default_forward_ref_subscripted_generic_typeddict(parser):
+    from typing_extensions import TypeVar as TypeVarExt
+
+    default_var = TypeVarExt("default_var", bound=Mapping[str, Any], default="GenericTypedDict[int]")
+    parser.add_argument("--options", type=Optional[default_var])
+    assert parser.parse_args(['--options={"extra": 1}']).options == {"extra": 1}
+    pytest.raises(ArgumentError, lambda: parser.parse_args(['--options={"extra": "x"}']))
+    help_str = get_parser_help(parser)
+    assert f"(type: {type_to_str(Optional[GenericTypedDict[int]])}, default: null)" in help_str
+    assert "Unvalidated" not in help_str
+
+
+def test_typevar_unresolvable_forward_ref(parser):
+    parser.add_function_arguments(function_typevar_unresolvable_bound, "x")
+    assert parser.parse_args(['--x.options={"anything": 1}']).x.options == {"anything": 1}
+    assert "Unvalidated<MisspelledOptions>" in get_parser_help(parser)
+
+
+UnresolvableBoundVar = TypeVar("UnresolvableBoundVar", bound="MisspelledOptions")  # type: ignore[name-defined]  # noqa: F821
+
+
+def function_typevar_unresolvable_bound(options: Optional[UnresolvableBoundVar] = None):
+    pass  # pragma: no cover
+
+
+def test_typevar_bound_forward_ref(parser):
+    bound_var = TypeVar("bound_var", bound="TypeVarTypedDict")
+    parser.add_argument("--options", type=Optional[bound_var])
+    assert parser.parse_args(['--options={"temperature": 0.5}']).options == {"temperature": 0.5}
+    pytest.raises(ArgumentError, lambda: parser.parse_args(['--options={"unknown": 1}']))
+
+
+def test_typevar_unresolvable_forward_ref_argument(parser):
+    parser.add_argument("--options", type=Optional[UnresolvableBoundVar])
+    # the bound fails to resolve, so the value is accepted without validation
+    assert parser.parse_args(['--options={"anything": 1}']).options == {"anything": 1}
+    assert parser.parse_args(["--options=abc"]).options == "abc"
+    assert "Unvalidated<MisspelledOptions>" in get_parser_help(parser)
+
+
+def test_typevar_unresolvable_forward_ref_constraint(parser):
+    constrained_var = TypeVar("constrained_var", "MisspelledOptions", int)  # noqa: F821
+    parser.add_argument("--options", type=Optional[constrained_var])
+    assert parser.parse_args(["--options=1"]).options == 1
+    # the constraint that fails to resolve accepts any value
+    assert parser.parse_args(['--options={"anything": 1}']).options == {"anything": 1}
+    assert "Unvalidated<MisspelledOptions>" in get_parser_help(parser)
+
+
+def test_type_typevar_unresolvable_forward_ref_bound(parser):
+    parser.add_argument("--cls", type=type[UnresolvableBoundVar])
+    # the bound fails to resolve, so any class is accepted
+    assert parser.parse_args(["--cls=calendar.Calendar"]).cls is calendar.Calendar
+    pytest.raises(ArgumentError, lambda: parser.parse_args(["--cls=not_a_class"]))
+    assert "(type: type[Unvalidated<MisspelledOptions>], default: null)" in get_parser_help(parser)
 
 
 # enum tests
@@ -1026,6 +1166,152 @@ def test_typeddict_with_not_required_arg(parser):
 @pytest.mark.skipif(not Required, reason="Required introduced in python 3.11 or backported in typing_extensions")
 def test_required_support():
     assert ActionTypeHint.is_supported_typehint(Required[Any])
+
+
+# subscripted generic TypedDict tests
+
+
+@skip_if_no_generic_typed_dict
+def test_subscripted_generic_typeddict(parser):
+    parser.add_argument("--options", type=Optional[GenericTypedDict[int]])
+    assert parser.parse_args(['--options={"temperature": 0.5, "stop": ["x"], "extra": 1, "extras": [2]}']).options == {
+        "temperature": 0.5,
+        "stop": ["x"],
+        "extra": 1,
+        "extras": [2],
+    }
+    with pytest.raises(ArgumentError) as ctx:
+        parser.parse_args(['--options={"unknown": 1}'])
+    ctx.match("Unexpected keys")
+    with pytest.raises(ArgumentError) as ctx:
+        parser.parse_args(['--options={"extra": "x"}'])
+    ctx.match("Expected a <class 'int'>")
+    with pytest.raises(ArgumentError) as ctx:
+        parser.parse_args(['--options={"extras": ["x"]}'])
+    ctx.match("Expected a <class 'int'>")
+    assert f"(type: {type_to_str(Optional[GenericTypedDict[int]])}, default: null)" in get_parser_help(parser)
+
+
+@skip_if_no_generic_typed_dict
+def test_subscripted_generic_typeddict_help(parser):
+    parser.add_argument("--options", type=Optional[GenericTypedDict[int]])
+    help_str = get_parse_args_stdout(parser, ["--options.help"])
+    assert f"Help for --options.help={__name__}.GenericTypedDict" in help_str
+    # the keys show what the type arguments substitute, the same as the value is validated
+    assert "--options.extra EXTRA" in help_str
+    assert "(type: int)" in help_str
+    assert "--options.extras [ITEM,...]" in help_str
+    assert f"(type: {type_to_str(List[int])})" in help_str
+
+
+@skip_if_docstring_parser_unavailable
+@skip_if_no_generic_typed_dict
+def test_subscripted_generic_typeddict_help_docstrings(parser):
+    parser.add_argument("--options", type=Optional[GenericTypedDict[int]])
+    help_str = get_parse_args_stdout(parser, ["--options.help"])
+    assert "Generic options:" in help_str
+    assert "Anything else. (type: int)" in help_str
+
+
+@skip_if_no_generic_typed_dict
+def test_unsubscripted_generic_typeddict(parser):
+    parser.add_argument("--options", type=Optional[GenericTypedDict])
+    # an unbound TypeVar stands for nothing, so the key accepts any value
+    assert parser.parse_args(['--options={"extra": [1, "x"]}']).options == {"extra": [1, "x"]}
+    assert parser.parse_args(['--options={"temperature": 0.5}']).options == {"temperature": 0.5}
+    with pytest.raises(ArgumentError) as ctx:
+        parser.parse_args(['--options={"unknown": 1}'])
+    ctx.match("Unexpected keys")
+    help_str = get_parse_args_stdout(parser, ["--options.help"])
+    assert "--options.extra EXTRA" in help_str
+    assert "(type: Unvalidated<GenericVar>)" in help_str
+
+
+@skip_if_no_generic_typed_dict
+def test_subscripted_generic_typeddict_with_typevar(parser):
+    parser.add_argument("--options", type=Optional[GenericTypedDict[GenericVar]])
+    # subscripted with a TypeVar that stands for nothing, so the key accepts any value
+    assert parser.parse_args(['--options={"extra": [1, "x"]}']).options == {"extra": [1, "x"]}
+    assert parser.parse_args(['--options={"stop": ["x"]}']).options == {"stop": ["x"]}
+
+
+@skip_if_no_generic_typed_dict
+def test_typeddict_inherits_subscripted_generic(parser):
+    parser.add_argument("--options", type=Optional[InheritsSubscriptedTypedDict])
+    # the key inherited from GenericTypedDict[int] is validated as an int
+    assert parser.parse_args(['--options={"extra": 1, "name": "x"}']).options == {"extra": 1, "name": "x"}
+    with pytest.raises(ArgumentError) as ctx:
+        parser.parse_args(['--options={"extra": "x"}'])
+    ctx.match("Expected a <class 'int'>")
+
+
+@skip_if_no_generic_typed_dict
+def test_typeddict_inherits_generic_subscripted(parser):
+    parser.add_argument("--options", type=Optional[InheritsGenericTypedDict[str]])
+    # the TypeVar of the base and of the subclass both stand for str
+    assert parser.parse_args(['--options={"extra": "x", "other": "y"}']).options == {"extra": "x", "other": "y"}
+    with pytest.raises(ArgumentError) as ctx:
+        parser.parse_args(['--options={"extra": 1}'])
+    ctx.match("Expected a <class 'str'>")
+    with pytest.raises(ArgumentError) as ctx:
+        parser.parse_args(['--options={"other": 1}'])
+    ctx.match("Expected a <class 'str'>")
+
+
+IntBoundVar = TypeVar("IntBoundVar", bound=int)
+
+if generic_typed_dict_support:
+
+    class BoundVarOptions(TypedDict, Generic[IntBoundVar], total=False):
+        value: IntBoundVar
+
+
+@skip_if_no_generic_typed_dict
+def test_typeddict_key_bound_typevar(parser):
+    parser.add_argument("--options", type=Optional[BoundVarOptions])
+    # not subscripted, so the TypeVar stands for its bound
+    assert parser.parse_args(['--options={"value": 1}']).options == {"value": 1}
+    with pytest.raises(ArgumentError) as ctx:
+        parser.parse_args(['--options={"value": "x"}'])
+    ctx.match("Expected a <class 'int'>")
+
+
+class UnsupportedKeyOptions(TypedDict, total=False):
+    supported: int
+    unsupported: Iterator[int]
+
+
+def test_typeddict_key_unsupported_type(parser):
+    parser.add_argument("--options", type=Optional[UnsupportedKeyOptions])
+    assert parser.parse_args(['--options={"supported": 1}']).options == {"supported": 1}
+    # a key that can't be validated accepts any value, the same as the help shows it
+    assert parser.parse_args(['--options={"unsupported": [1]}']).options == {"unsupported": [1]}
+    help_str = get_parse_args_stdout(parser, ["--options.help"])
+    assert "--options.unsupported UNSUPPORTED" in help_str
+    assert "(type: Unvalidated<Iterator[int]>)" in help_str
+
+
+def test_subscripted_non_generic_typeddict(parser):
+    parser.add_argument("--options", type=Optional[TypeVarTypedDict[None]])
+    assert parser.parse_args(['--options={"temperature": 0.5}']).options == {"temperature": 0.5}
+    with pytest.raises(ArgumentError) as ctx:
+        parser.parse_args(['--options={"unknown": 1}'])
+    ctx.match("Unexpected keys")
+    assert f"(type: {type_to_str(Optional[TypeVarTypedDict[None]])}, default: null)" in get_parser_help(parser)
+
+
+@pytest.mark.skipif(not typing_extensions_support, reason="typing_extensions package is required")
+@skip_if_no_generic_typed_dict
+def test_typevar_default_subscripted_generic_typeddict(parser):
+    from typing_extensions import TypeVar as TypeVarExt
+
+    options_var = TypeVarExt("options_var", bound=Mapping[str, Any], default=GenericTypedDict[int])
+    parser.add_argument("--options", type=Optional[options_var])
+    assert parser.parse_args(['--options={"extra": 1}']).options == {"extra": 1}
+    pytest.raises(ArgumentError, lambda: parser.parse_args(['--options={"unknown": 1}']))
+    help_str = get_parser_help(parser)
+    assert f"(type: {type_to_str(Optional[GenericTypedDict[int]])}, default: null)" in help_str
+    assert "Unvalidated" not in help_str
 
 
 @pytest.mark.skipif(not Required, reason="Required introduced in python 3.11 or backported in typing_extensions")
@@ -1916,8 +2202,9 @@ unvalidated_type = UnvalidatedType("some.SomeType")
             "int | Any | Unvalidated<SomeType>",
         ),
         (Union[str, Any], "Union[str, Any]", "str | Any"),
-        # object last, since it accepts the import path of any class
+        # object last, since like Any it accepts any value
         (Union[object, int], "Union[int, object]", "int | object"),
+        (Union[object, None], "Optional[object]", "null | object"),
         # None second to last, so that Optional keeps its form
         (Optional[str], "Optional[str]", "str | null"),
         (Optional[int], "Optional[int]", "int | null"),
@@ -1952,7 +2239,7 @@ def test_union_subtypes_sorted_on_add_argument(parser, typehint, expected, expec
     [
         (object | int, "int | object"),
         (int | None, "int | null"),
-        (object | int | None, "int | object | null"),
+        (object | int | None, "int | null | object"),
         (list[object | int], "list[int | object]"),
     ],
     ids=str,
@@ -1964,7 +2251,9 @@ def test_union_subtypes_sorted_new_syntax(parser, typehint, expected):
     assert type_to_str(action._typehint) == expected
 
 
-@pytest.mark.parametrize("typehint", [Union[unvalidated_type, EnumABC], Union[Any, EnumABC]], ids=str)
+@pytest.mark.parametrize(
+    "typehint", [Union[unvalidated_type, EnumABC], Union[Any, EnumABC], Union[object, EnumABC]], ids=str
+)
 def test_union_subtypes_sorted_accept_any_last_parse(parser, typehint):
     # without the sorting the value would be accepted as is by the first subtype
     parser.add_argument("--val", type=typehint)
@@ -2285,6 +2574,25 @@ def test_callable_protocol_instance_factory(parser, subtests):
         assert f"Help for --optimizer.help={__name__}.DifferentParamsOrder" in help_str
         assert "--optimizer.lr" in help_str
         assert "--optimizer.params" not in help_str
+
+
+OptimizerVar = TypeVar("OptimizerVar", covariant=True)
+
+
+class GenericOptimizerFactory(Protocol[OptimizerVar]):
+    def __call__(self, params: List[float]) -> OptimizerVar: ...
+
+
+def test_subscripted_generic_callable_protocol_instance_factory(parser):
+    parser.add_argument("--optimizer", type=GenericOptimizerFactory[Optimizer])
+    # the return type of __call__ is what the protocol is subscripted with, so
+    # the class is resolved by name from the subclasses of Optimizer
+    cfg = parser.parse_args(["--optimizer=Adam", "--optimizer.lr=0.01"])
+    assert cfg.optimizer.class_path == f"{__name__}.Adam"
+    init = parser.instantiate(cfg)
+    optimizer = init.optimizer(params=[1, 2])
+    assert isinstance(optimizer, Adam)
+    assert optimizer.lr == 0.01
 
 
 class OptimizerFactoryPositionalAndKeyword(Protocol):

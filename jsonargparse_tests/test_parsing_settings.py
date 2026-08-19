@@ -519,10 +519,38 @@ def test_validate_subclass_spec_in_any_enabled_non_subclass_dict_kept(parser):
     assert cfg.any == {"a": 0, "b": 1}
 
 
+# validate_subclass_spec_in_any for object, which like Any accepts any value
+
+
+def test_validate_subclass_spec_in_any_object_disabled_kept(parser):
+    parser.add_argument("--obj", type=object)
+
+    cfg = parser.parse_args(['--obj={"class_path": "nonexistent.Foo"}'])
+    assert cfg.obj == {"class_path": "nonexistent.Foo"}
+
+
+def test_validate_subclass_spec_in_any_object_enabled_fails(parser):
+    set_parsing_settings(validate_subclass_spec_in_any=True)
+    parser.add_argument("--obj", type=object)
+
+    with pytest.raises(ArgumentError, match="Invalid subclass spec given as value for type object"):
+        parser.parse_args(['--obj={"class_path": "nonexistent.Foo"}'])
+
+
+def test_validate_subclass_spec_in_any_enabled_union_object_fails(parser):
+    set_parsing_settings(validate_subclass_spec_in_any=True)
+    parser.add_argument("--union", type=Optional[Union[AnySubclass, object]])
+
+    with pytest.raises(ArgumentError) as ctx:
+        parser.parse_args([f'--union={{"class_path": "{__name__}.AnySubclass", "init_args": {{"nope": 1}}}}'])
+    ctx.match("Does not validate against any of the Union subtypes")
+    ctx.match("Invalid subclass spec given as value for type object")
+
+
 # validate_subclass_spec_in_any for dict types that accept any value
 
 unvalidated_dict_type = Dict[str, UnvalidatedType("some.SomeType")]  # type: ignore[misc,valid-type]
-any_dict_types = [dict, Dict, Dict[str, Any], unvalidated_dict_type]
+any_dict_types = [dict, Dict, Dict[str, Any], Dict[str, object], unvalidated_dict_type]
 
 
 @pytest.mark.parametrize("dict_type", any_dict_types)
@@ -596,16 +624,18 @@ def test_validate_subclass_spec_in_any_enabled_typed_dict_unaffected(parser):
     assert cfg.dict == {"class_path": "nonexistent.Foo"}
 
 
-def test_validate_subclass_spec_in_any_disabled_union_dict_swallows(parser):
-    parser.add_argument("--union", type=Optional[Union[AnySubclass, Dict[str, Any]]])
+@pytest.mark.parametrize("dict_type", [Dict[str, Any], Dict[str, object]])
+def test_validate_subclass_spec_in_any_disabled_union_dict_swallows(parser, dict_type):
+    parser.add_argument("--union", type=Optional[Union[AnySubclass, dict_type]])
 
     cfg = parser.parse_args([f'--union={{"class_path": "{__name__}.AnySubclass", "init_args": {{"nope": 1}}}}'])
     assert cfg.union == {"class_path": f"{__name__}.AnySubclass", "init_args": {"nope": 1}}
 
 
-def test_validate_subclass_spec_in_any_enabled_union_dict_fails(parser):
+@pytest.mark.parametrize("dict_type", [Dict[str, Any], Dict[str, object]])
+def test_validate_subclass_spec_in_any_enabled_union_dict_fails(parser, dict_type):
     set_parsing_settings(validate_subclass_spec_in_any=True)
-    parser.add_argument("--union", type=Optional[Union[AnySubclass, Dict[str, Any]]])
+    parser.add_argument("--union", type=Optional[Union[AnySubclass, dict_type]])
 
     with pytest.raises(ArgumentError) as ctx:
         parser.parse_args([f'--union={{"class_path": "{__name__}.AnySubclass", "init_args": {{"nope": 1}}}}'])
@@ -656,6 +686,45 @@ def test_instantiate_subclass_spec_in_any_disabled(parser):
     assert init.any == any_subclass_namespace
 
     assert json_or_yaml_load(parser.dump(cfg)) == {"any": any_subclass_spec}
+
+
+def test_instantiate_subclass_spec_in_any_object(parser):
+    set_parsing_settings(instantiate_subclass_spec_in_any=True)
+    parser.add_argument("--obj", type=object)
+
+    cfg = parser.parse_args([f"--obj={json.dumps(any_subclass_spec)}"])
+    assert cfg.obj == any_subclass_namespace
+    init = parser.instantiate(cfg)
+    assert isinstance(init.obj, AnySubclass)
+    assert init.obj.p == 3
+
+
+def test_instantiate_subclass_spec_in_any_object_disabled(parser):
+    set_parsing_settings(instantiate_subclass_spec_in_any=False)
+    parser.add_argument("--obj", type=object)
+
+    cfg = parser.parse_args([f"--obj={json.dumps(any_subclass_spec)}"])
+    init = parser.instantiate(cfg)
+    assert init.obj == any_subclass_namespace
+    assert json_or_yaml_load(parser.dump(cfg)) == {"obj": any_subclass_spec}
+
+
+class AnyInitArg:
+    def __init__(self, a: Any = None):
+        self.a = a
+
+
+def test_instantiate_subclass_spec_in_any_disabled_as_init_arg(parser):
+    set_parsing_settings(instantiate_subclass_spec_in_any=False)
+    parser.add_subclass_arguments(AnyInitArg, "cls")
+
+    spec = {"class_path": f"{__name__}.AnyInitArg", "init_args": {"a": any_subclass_spec}}
+    cfg = parser.parse_args([f"--cls={json.dumps(spec)}"])
+    assert cfg.cls.init_args.a == any_subclass_namespace
+
+    init = parser.instantiate(cfg)
+    assert isinstance(init.cls, AnyInitArg)
+    assert init.cls.a == any_subclass_namespace
 
 
 def test_instantiate_subclass_spec_in_any_disabled_nested_in_list_and_dict(parser):

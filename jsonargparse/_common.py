@@ -162,21 +162,22 @@ def set_parsing_settings(
             argument type. The default is ``False``, meaning no default
             validation, like in argparse.
         validate_subclass_spec_in_any: If ``True``, when a value for a type that
-            accepts any value, i.e. ``Any``, ``Unvalidated<...>`` or a dict that
-            doesn't validate its values, looks like a subclass spec (i.e. a dict
-            with a ``class_path`` key), it is required to be a valid one,
-            otherwise the parsing fails. For dicts the spec is only validated,
-            since the value is kept as a dict. By default, this is ``False``,
-            meaning that an invalid subclass spec is ignored (a debug log is
-            emitted) and the original value is kept.
+            accepts any value, i.e. ``Any``, ``object``, ``Unvalidated<...>`` or
+            a dict that doesn't validate its values, looks like a subclass spec
+            (i.e. a dict with a ``class_path`` key), it is required to be a
+            valid one, otherwise the parsing fails. For dicts the spec is only
+            validated, since the value is kept as a dict. By default, this is
+            ``False``, meaning that an invalid subclass spec is ignored (a debug
+            log is emitted) and the original value is kept.
         instantiate_subclass_spec_in_any: Whether ``instantiate`` builds the
-            class when a value for a type that accepts any value, i.e. ``Any``
-            or ``Unvalidated<...>``, is a valid subclass spec. If ``False``, the
-            value is kept as a subclass spec, which the code that receives it
-            can instantiate itself if desired. Currently the default is ``True``
-            and a deprecation warning is emitted, since from v5.0.0 the default
-            will be ``False``. Enabling it is discouraged because it means that
-            any class can be instantiated, so only do it for trusted configs.
+            class when a value for a type that accepts any value, i.e. ``Any``,
+            ``object`` or ``Unvalidated<...>``, is a valid subclass spec. If
+            ``False``, the value is kept as a subclass spec, which the code that
+            receives it can instantiate itself if desired. Currently the default
+            is ``True`` and a deprecation warning is emitted, since from v5.0.0
+            the default will be ``False``. Enabling it is discouraged because it
+            means that any class can be instantiated, so only do it for trusted
+            configs.
         config_read_mode_urls_enabled: Whether to read config files from URLs
             using requests package. Default is ``False``.
         config_read_mode_fsspec_enabled: Whether to read config files from
@@ -399,7 +400,8 @@ def get_unaliased_type(cls):
 
 def is_pure_dataclass(cls) -> bool:
     classes = [c for c in inspect.getmro(cls) if c not in {object, Generic}]
-    return all(dataclasses.is_dataclass(c) for c in classes)
+    # bool(classes) since e.g. object itself has no class in its mro that could be a dataclass
+    return bool(classes) and all(dataclasses.is_dataclass(c) for c in classes)
 
 
 subclasses_enabled_types: set[type] = set()
