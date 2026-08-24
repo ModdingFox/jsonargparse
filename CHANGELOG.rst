@@ -23,7 +23,12 @@ Added
   set of standard library paths that give code execution, e.g. ``os``,
   ``subprocess`` and ``pickle``, is denied by default, see
   :ref:`untrusted-configs` (`#959
-  <https://github.com/mauvilsa/jsonargparse/pull/959>`__).
+  <https://github.com/mauvilsa/jsonargparse/pull/959>`__, `#960
+  <https://github.com/mauvilsa/jsonargparse/pull/960>`__).
+- Class types nested in a ``tuple``, ``set``, ``frozenset`` or mapping, e.g.
+  ``dict[str, SomeBaseClass]``, now have a ``--*.help`` option, and subclasses
+  in any container are now included in the known subclasses shown in the help
+  (`#960 <https://github.com/mauvilsa/jsonargparse/pull/960>`__).
 
 Fixed
 ^^^^^
@@ -35,6 +40,16 @@ Fixed
 - Instance factory protocols with a ``__call__`` that takes no parameters
   instantiated the class instead of giving a factory (`#959
   <https://github.com/mauvilsa/jsonargparse/pull/959>`__).
+- ``Literal`` with arguments that are attributes of the class in whose body the
+  method is defined failed to resolve when annotations are postponed (`#960
+  <https://github.com/mauvilsa/jsonargparse/pull/960>`__).
+- ``set`` and ``frozenset`` of a class type failed to parse because subclass
+  specs are not hashable (`#960
+  <https://github.com/mauvilsa/jsonargparse/pull/960>`__).
+- Shell completion of a ``--*.help`` option gave wrong choices when the class
+  type is nested in a container or optional, e.g. ``builtins.NoneType`` for
+  ``Optional[list[SomeBaseClass]]`` (`#960
+  <https://github.com/mauvilsa/jsonargparse/pull/960>`__).
 
 Deprecated
 ^^^^^^^^^^
