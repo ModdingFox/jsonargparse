@@ -206,32 +206,6 @@ tool supports with their default values. Users can follow these steps:
     # Run the tool using the adapted config
     python example.py --config config.yaml
 
-Comparison to Fire
-------------------
-
-The :func:`.auto_cli` feature is similar to and inspired by `Fire
-<https://pypi.org/project/fire/>`__. However, there are fundamental differences.
-First, the purpose is not to allow calling any Python object from the command
-line. It is only intended for running functions and classes specifically written
-for this purpose. Second, the arguments are expected to have type hints, and the
-given values will be validated according to these. Third, the return values of
-the functions are not automatically printed. :func:`.auto_cli` returns the value
-and it is up to the developer to decide what to do with it.
-
-
-.. _tutorials:
-
-Tutorials
-=========
-
-- `"jsonargparse - Say goodbye to configuration hassles"
-  <https://2022.pycon.de/program/XK73C3/>`__  by Marianne Stecklina at PyCon DE
-  & PyData Berlin 2022
-
-    - Presentation video: https://youtu.be/2gDf2S0nHKg
-    - GitHub repository: https://github.com/stecklin/pycon22-jsonargparse
-
-
 .. _parsers:
 
 Parsers
@@ -587,7 +561,10 @@ Some notes about this support are:
   ``Proto[int]``. Subscripting substitutes the type arguments in the protocol's
   methods, so ``Proto[int]`` and ``Proto[str]`` accept different
   implementations. A ``TypeVar`` that remains, in the protocol or in the
-  implementation, matches any type, as static type checkers do.
+  implementation, matches any type, as static type checkers do. A protocol whose
+  single method is ``__call__`` is also implemented by a function with a
+  compatible signature, in which case the value is the function itself, instead
+  of a class to instantiate.
 
 - ``dataclasses``, final classes, attrs' ``define``, pydantic's ``dataclass``
   and pydantic's ``BaseModel`` are supported even when nested. By default they
@@ -620,8 +597,10 @@ Some notes about this support are:
   subclass of the return type of the callable. For these cases running
   :meth:`instantiate <.ArgumentParser.instantiate>` will instantiate the class
   or provide a function that returns the instance of the class. For more details
-  see :ref:`callable-type`. Currently the callable's argument and return types
-  are not validated.
+  see :ref:`callable-type`. A function given by import path must have a return
+  annotation, or a return type in a stub file (see :ref:`stubs-resolver`), that
+  is the callable's return type or a subclass of it. Argument types are not
+  validated.
 
 - ``types.ModuleType`` is supported by giving the dot import path of a module,
   and on ``instantiate`` is replaced by the imported module object.
