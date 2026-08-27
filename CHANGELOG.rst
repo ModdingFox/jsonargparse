@@ -79,6 +79,14 @@ Fixed
   and a composed one, e.g. ``Optional[Hashable]``, raised ``Unsupported type
   hint`` (`#963 <https://github.com/mauvilsa/jsonargparse/pull/963>`__).
 
+Changed
+^^^^^^^
+- The documentation has been reworded throughout to be shorter and easier to
+  read, and corrected in the places where it did not describe what the code does
+  (`#964 <https://github.com/mauvilsa/jsonargparse/pull/964>`__).
+- New :ref:`migrate-v5` guide that describes what needs to be changed to migrate
+  from v4 to v5 (`#964 <https://github.com/mauvilsa/jsonargparse/pull/964>`__).
+
 Deprecated
 ^^^^^^^^^^
 - Values that name a denied import path, e.g. a ``class_path`` of
