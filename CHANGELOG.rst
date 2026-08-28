@@ -82,6 +82,14 @@ Fixed
   ``collections.abc`` spelling of the same types was. A bare one didn't validate
   and a composed one, e.g. ``Optional[Hashable]``, raised ``Unsupported type
   hint`` (`#963 <https://github.com/mauvilsa/jsonargparse/pull/963>`__).
+- A ``Callable`` default that can't be imported back, was silently dumped as a
+  non-importable ``<locals>`` import path. Now the default is kept as the object
+  and dumping it gives the not serializable message and a warning (`#966
+  <https://github.com/mauvilsa/jsonargparse/pull/966>`__).
+- Types registered with ``register_type`` were ignored when the type is
+  subscripted, e.g. ``os.PathLike[str]`` for a registered ``PathLike``. Now the
+  registration of the unsubscripted type is used (`#966
+  <https://github.com/mauvilsa/jsonargparse/pull/966>`__).
 
 Changed
 ^^^^^^^
@@ -101,6 +109,12 @@ Changed
   makes the type optional, a ``NotRequired`` parameter without a default and a
   parameter that is the target of a link (`#965
   <https://github.com/mauvilsa/jsonargparse/pull/965>`__).
+- ``register_type`` no longer fails when the type is already registered. The new
+  registration now replaces the previous one and a debug log informs about it,
+  naming the module of each registration. This way a new type registered by
+  jsonargparse doesn't break code that already registers it. The previous
+  behavior is available with ``fail_already_registered=True`` (`#966
+  <https://github.com/mauvilsa/jsonargparse/pull/966>`__).
 
 Deprecated
 ^^^^^^^^^^
